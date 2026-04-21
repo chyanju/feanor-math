@@ -38,6 +38,10 @@ where
     ///
     /// `result` is the reduced S-polynomial (before it gets its own basis
     /// index assigned).
+    /// Called once after the initial inter-reduction of input polynomials,
+    /// reporting how many basis elements survived (indices 0..count-1).
+    fn on_initial_basis(&mut self, _count: usize) {}
+
     fn on_new_poly(&mut self, _parent_indices: &[usize], _result: &El<P>) {}
 
     /// Called when inter-reduction replaces `basis[index]` with a new
@@ -445,6 +449,7 @@ where
             .map(|(f, _)| f)
             .collect::<Vec<_>>();
             debug_assert!(input_basis.iter().all(|f| !ring.is_zero(f)));
+            observer.on_initial_basis(input_basis.len());
 
             let nilpotent_power = ring
                 .base_ring()
@@ -560,13 +565,14 @@ where
                         // it already is a GB; more concretely, reducers
                         // contains polys of basis that are reduced with eath other, but the
                         // S-polys between two of them might not have been considered
-                        return buchberger::<P, O, _, _, _>(
+                        return buchberger_observed::<P, O, _, _, _, Obs>(
                             ring,
                             reducers.into_iter().map(|(f, _)| f).collect(),
                             order,
                             sort_spolys,
                             abort_early_if,
                             controller,
+                            observer,
                         );
                     } else {
                         return Ok(reducers.into_iter().map(|(f, _)| f).collect());
@@ -610,13 +616,14 @@ where
                     > reducers.len() * reducers.len() / 2 + reducers.len() * nilpotent_power.unwrap_or(0) + 1
                 {
                     log_progress!(controller, "!");
-                    return buchberger::<P, O, _, _, _>(
+                    return buchberger_observed::<P, O, _, _, _, Obs>(
                         ring,
                         reducers.into_iter().map(|(f, _)| f).collect(),
                         order,
                         sort_spolys,
                         abort_early_if,
                         controller,
+                        observer,
                     );
                 }
             }
