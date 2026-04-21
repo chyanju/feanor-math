@@ -14,6 +14,47 @@ use crate::ring::*;
 use crate::rings::multivariate::*;
 use crate::seq::*;
 
+/// Observer trait for Buchberger algorithm steps.
+///
+/// Implement this trait to trace the derivation history of polynomials
+/// during a Groebner basis computation.  This enables UNSAT core
+/// extraction by tracking which input polynomials contribute to each
+/// derived polynomial.
+///
+/// All methods have default empty implementations, so you only need to
+/// override the ones you care about.
+#[stability::unstable(feature = "enable")]
+pub trait BuchbergerObserver<P: RingStore>
+where
+    P::Type: MultivariatePolyRing,
+{
+    /// Called when an S-polynomial `spoly(basis[i], basis[j])` has been
+    /// reduced to a non-zero polynomial `result`, which will be added to
+    /// the basis.
+    ///
+    /// `parent_indices` contains the basis indices of the parents:
+    ///   - For `SPoly::Standard(i, j)`: `[i, j]`
+    ///   - For `SPoly::Nilpotent(i, _)`: `[i]`
+    ///
+    /// `result` is the reduced S-polynomial (before it gets its own basis
+    /// index assigned).
+    fn on_new_poly(&mut self, _parent_indices: &[usize], _result: &El<P>) {}
+
+    /// Called when inter-reduction replaces `basis[index]` with a new
+    /// reduced form.  The new form depends on all other basis elements
+    /// that were used as reducers.
+    fn on_inter_reduce(&mut self, _index: usize, _new_form: &El<P>) {}
+}
+
+/// A no-op observer that does nothing.
+#[stability::unstable(feature = "enable")]
+pub struct NoObserver;
+
+impl<P: RingStore> BuchbergerObserver<P> for NoObserver
+where
+    P::Type: MultivariatePolyRing,
+{}
+
 #[stability::unstable(feature = "enable")]
 #[derive(PartialEq, Clone, Eq, Hash)]
 pub enum SPoly {
@@ -341,8 +382,8 @@ pub fn buchberger<P, O, Controller, SortFn, AbortFn>(
     ring: P,
     input_basis: Vec<El<P>>,
     order: O,
-    mut sort_spolys: SortFn,
-    mut abort_early_if: AbortFn,
+    sort_spolys: SortFn,
+    abort_early_if: AbortFn,
     controller: Controller,
 ) -> Result<Vec<El<P>>, Controller::Abort>
 where
@@ -356,6 +397,35 @@ where
     Controller: ComputationController,
     SortFn: FnMut(&mut [SPoly], &[El<P>]),
     AbortFn: FnMut(&[(El<P>, ExpandedMonomial)]) -> bool,
+{
+    buchberger_observed(ring, input_basis, order, sort_spolys, abort_early_if, controller, &mut NoObserver)
+}
+
+/// Like [`buchberger`], but with an observer that receives callbacks for
+/// each new polynomial derived during the computation.  This enables
+/// dependency tracking for UNSAT core extraction.
+#[stability::unstable(feature = "enable")]
+pub fn buchberger_observed<P, O, Controller, SortFn, AbortFn, Obs>(
+    ring: P,
+    input_basis: Vec<El<P>>,
+    order: O,
+    mut sort_spolys: SortFn,
+    mut abort_early_if: AbortFn,
+    controller: Controller,
+    observer: &mut Obs,
+) -> Result<Vec<El<P>>, Controller::Abort>
+where
+    P: RingStore + Copy + Send + Sync,
+    El<P>: Send + Sync,
+    P::Type: MultivariatePolyRing,
+    <P::Type as RingExtension>::BaseRing: Sync,
+    <<P::Type as RingExtension>::BaseRing as RingStore>::Type: PrincipalLocalRing,
+    O: MonomialOrder + Copy + Send + Sync,
+    PolyCoeff<P>: Send + Sync,
+    Controller: ComputationController,
+    SortFn: FnMut(&mut [SPoly], &[El<P>]),
+    AbortFn: FnMut(&[(El<P>, ExpandedMonomial)]) -> bool,
+    Obs: BuchbergerObserver<P>,
 {
     controller.run_computation(
         format_args!(
@@ -436,7 +506,9 @@ where
 
                 let computation = ShortCircuitingComputation::new();
                 let new_polys = AppendOnlyVec::new();
+                let new_poly_parents = AppendOnlyVec::new();
                 let new_polys_ref = &new_polys;
+                let new_poly_parents_ref = &new_poly_parents;
                 let basis_ref = &basis;
                 let reducers_ref = &reducers;
 
@@ -444,6 +516,10 @@ where
                     .handle(controller.clone())
                     .join_many(spolys_to_reduce.as_fn().map_fn(move |spoly| {
                         move |handle: ShortCircuitingComputationHandle<(), _>| {
+                            let parent_info: Vec<usize> = match spoly {
+                                SPoly::Standard(i, j) => vec![*i, *j],
+                                SPoly::Nilpotent(i, _) => vec![*i],
+                            };
                             let mut f = spoly.poly(ring, basis_ref, order);
 
                             reduce_poly(
@@ -455,6 +531,7 @@ where
 
                             if !ring.is_zero(&f) {
                                 log_progress!(handle, "s");
+                                _ = new_poly_parents_ref.push(parent_info);
                                 _ = new_polys_ref.push(augment_lm(ring, f, order));
                             } else {
                                 log_progress!(handle, "-");
@@ -467,7 +544,13 @@ where
 
                 drop(open.drain(spolys_to_reduce_index..));
                 let new_polys = new_polys.into_vec();
+                let new_poly_parents = new_poly_parents.into_vec();
                 _ = computation.finish()?;
+
+                // Notify observer of newly derived polynomials
+                for (parents, (poly, _)) in new_poly_parents.iter().zip(new_polys.iter()) {
+                    observer.on_new_poly(parents, poly);
+                }
 
                 // process the generated new polynomials
                 if new_polys.is_empty() && open.is_empty() {
