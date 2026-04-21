@@ -28,6 +28,10 @@ pub trait BuchbergerObserver<P: RingStore>
 where
     P::Type: MultivariatePolyRing,
 {
+    /// Called once after the initial inter-reduction of input polynomials,
+    /// reporting how many basis elements survived (indices 0..count-1).
+    fn on_initial_basis(&mut self, _count: usize) {}
+
     /// Called when an S-polynomial `spoly(basis[i], basis[j])` has been
     /// reduced to a non-zero polynomial `result`, which will be added to
     /// the basis.
@@ -38,10 +42,6 @@ where
     ///
     /// `result` is the reduced S-polynomial (before it gets its own basis
     /// index assigned).
-    /// Called once after the initial inter-reduction of input polynomials,
-    /// reporting how many basis elements survived (indices 0..count-1).
-    fn on_initial_basis(&mut self, _count: usize) {}
-
     fn on_new_poly(&mut self, _parent_indices: &[usize], _result: &El<P>) {}
 
     /// Called when inter-reduction replaces `basis[index]` with a new
