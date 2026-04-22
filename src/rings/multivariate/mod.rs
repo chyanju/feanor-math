@@ -57,6 +57,27 @@ pub trait MultivariatePolyRing: RingExtension {
     /// Multiplies the given polynomial with the given monomial.
     fn mul_assign_monomial(&self, f: &mut Self::Element, monomial: Self::Monomial);
 
+    /// Fused multiply-subtract: `target -= coeff * monomial * reducer`.
+    ///
+    /// Default implementation clones, scales, and subtracts.  Specialized
+    /// implementations (e.g. `MultivariatePolyRingImplBase`) override this
+    /// with a single-pass merge for better performance.
+    fn sub_assign_mul_monomial(&self, target: &mut Self::Element, reducer: &Self::Element,
+                               coeff: &El<Self::BaseRing>, monomial: &Self::Monomial)
+    {
+        let mut scaled = self.clone_el(reducer);
+        self.mul_assign_monomial(&mut scaled, self.clone_monomial(monomial));
+        // Scale each coefficient by coeff by negating, multiplying, re-negating
+        // (we need sub, and the simplest generic way is: target -= scaled*coeff)
+        // Since we don't have a generic scale method, use the 3-step approach:
+        let coeff_poly = self.create_term(
+            self.base_ring().clone_el(coeff),
+            self.create_monomial((0..self.indeterminate_count()).map(|_| 0)),
+        );
+        self.mul_assign(&mut scaled, coeff_poly);
+        self.sub_assign(target, scaled);
+    }
+
     /// Returns the coefficient corresponding to the given monomial in the given polynomial.
     /// If the polynomial does not contain a term with that monomial, zero is returned.
     fn coefficient_at<'a>(&'a self, f: &'a Self::Element, m: &Self::Monomial) -> &'a El<Self::BaseRing>;
@@ -287,6 +308,12 @@ where
     delegate! { MultivariatePolyRing, fn monomial_div(&self, lhs: PolyMonomial<Self>, rhs: &PolyMonomial<Self>) -> Result<PolyMonomial<Self>, PolyMonomial<Self>> }
     delegate! { MultivariatePolyRing, fn monomial_deg(&self, val: &PolyMonomial<Self>) -> usize }
     delegate! { MultivariatePolyRing, fn mul_assign_monomial(&self, f: &mut El<Self>, monomial: PolyMonomial<Self>) -> () }
+
+    fn sub_assign_mul_monomial(&self, target: &mut El<Self>, reducer: &El<Self>,
+                               coeff: &PolyCoeff<Self>, monomial: &PolyMonomial<Self>) {
+        self.get_ring().sub_assign_mul_monomial(target, reducer, coeff, monomial);
+    }
+
     delegate! { MultivariatePolyRing, fn appearing_indeterminates(&self, f: &El<Self>) -> Vec<(usize, usize)> }
     delegate! { MultivariatePolyRing, fn specialize(&self, f: &El<Self>, var: usize, val: &El<Self>) -> El<Self> }
 

@@ -452,6 +452,40 @@ where
         debug_assert!(self.is_valid(el));
     }
 
+    /// Compute monomial product order index without the multiplication table.
+    fn mul_monomial_fallback(&self, lhs: &MonomialIdentifier, rhs: &MonomialIdentifier) -> u64 {
+        let (mut lhs_mon, mut rhs_mon) = self.tmp_monomials();
+        nth_monomial_degrevlex(
+            self.variable_count,
+            lhs.data.deg,
+            lhs.data.order,
+            &self.cum_binomial_lookup_table,
+            |i, x| lhs_mon[i] = x,
+        );
+        nth_monomial_degrevlex(
+            self.variable_count,
+            rhs.data.deg,
+            rhs.data.order,
+            &self.cum_binomial_lookup_table,
+            |i, x| rhs_mon[i] = x,
+        );
+        for i in 0..self.variable_count {
+            lhs_mon[i] += rhs_mon[i];
+        }
+        let res_deg = lhs.data.deg + rhs.data.deg;
+        assert!(
+            res_deg <= self.max_supported_deg,
+            "Polynomial ring was configured to support monomials up to degree {}, but multiplication resulted in degree {}",
+            self.max_supported_deg,
+            res_deg
+        );
+        enumeration_index_degrevlex(
+            res_deg,
+            (*lhs_mon).clone_els_by(|x| *x),
+            &self.cum_binomial_lookup_table,
+        )
+    }
+
     /// Computes the sum of two elements; rhs may contain zero elements, but must be sorted and not
     /// contain equal monomials
     fn add_terms<I>(
@@ -495,6 +529,50 @@ where
         self.remove_zeros(&mut result);
         debug_assert!(self.is_valid(&result));
         return MultivariatePolyRingEl { data: result };
+    }
+
+    /// Fused multiply-subtract: `target -= coeff * monomial * reducer`.
+    ///
+    /// Single-pass merge matching CoCoA's `myAddMulSummand`: walks `target`
+    /// and `reducer` simultaneously, multiplying each reducer term by
+    /// `(coeff, monomial)` on-the-fly and subtracting/cancelling in-place.
+    /// Avoids the intermediate polynomial allocation of the naive
+    /// `clone + mul_monomial + sub` pattern.
+    pub fn sub_assign_mul_monomial(&self, target: &mut <Self as RingBase>::Element,
+                                   reducer: &<Self as RingBase>::Element,
+                                   coeff: &El<R>,
+                                   monomial: &MonomialIdentifier)
+    {
+        debug_assert!(self.is_valid(&target.data));
+        debug_assert!(self.is_valid(&reducer.data));
+
+        let mon_deg = monomial.data.deg;
+
+        let rhs_iter = reducer.data.iter().map(|(r_c, r_m)| {
+            let r_deg = r_m.data.deg;
+            let new_deg = r_deg + mon_deg;
+            let new_order = if r_deg <= mon_deg {
+                if let Some(table) = self.try_get_multiplication_table(r_deg, mon_deg) {
+                    table[r_m.data.order as usize][monomial.data.order as usize]
+                } else {
+                    self.mul_monomial_fallback(r_m, monomial)
+                }
+            } else {
+                if let Some(table) = self.try_get_multiplication_table(mon_deg, r_deg) {
+                    table[monomial.data.order as usize][r_m.data.order as usize]
+                } else {
+                    self.mul_monomial_fallback(r_m, monomial)
+                }
+            };
+            let new_mon = MonomialIdentifier {
+                data: InternalMonomialIdentifier { deg: new_deg, order: new_order },
+            };
+            let scaled_c = self.base_ring().mul_ref(coeff, r_c);
+            let neg_c = self.base_ring().negate(scaled_c);
+            (neg_c, new_mon)
+        });
+
+        *target = self.add_terms(target, rhs_iter, Vec::new_in(self.allocator.clone()));
     }
 }
 
@@ -878,6 +956,11 @@ where
             debug_assert!(new_val.data == fallback().data);
             *lhs = new_val;
         }
+    }
+
+    fn sub_assign_mul_monomial(&self, target: &mut Self::Element, reducer: &Self::Element,
+                               coeff: &El<Self::BaseRing>, monomial: &Self::Monomial) {
+        MultivariatePolyRingImplBase::sub_assign_mul_monomial(self, target, reducer, coeff, monomial);
     }
 
     fn coefficient_at<'a>(&'a self, f: &'a Self::Element, m: &Self::Monomial) -> &'a El<Self::BaseRing> {
