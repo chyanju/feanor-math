@@ -218,9 +218,16 @@ where
     }
     let (f_lc, f_lm) = ring.LT(f, order).unwrap();
     let f_lm_expanded = ring.expand_monomial(f_lm);
+    let f_mask = divmask(&f_lm_expanded);
     reducers
         .enumerate()
         .filter_map(|(i, (reducer, reducer_lm_expanded))| {
+            // DivMask fast rejection: if the reducer has a variable with
+            // positive exponent where f has zero exponent, skip.
+            let r_mask = divmask(reducer_lm_expanded);
+            if (r_mask & !f_mask) != 0 {
+                return None;
+            }
             if (0..ring.indeterminate_count()).all(|j| reducer_lm_expanded[j] <= f_lm_expanded[j]) {
                 let (r_lc, r_lm) = ring.LT(reducer, order).unwrap();
                 let quo_m = ring.monomial_div(ring.clone_monomial(f_lm), r_lm).ok().unwrap();
@@ -334,6 +341,29 @@ where
 
 #[stability::unstable(feature = "enable")]
 pub type ExpandedMonomial = Vec<usize>;
+
+/// Compute a DivMask for an expanded monomial.  Bit `i` is set iff
+/// `exponents[i % n_vars] > 0`.  This allows O(1) rejection of most
+/// non-divisibility checks: if `(mask_divisor & !mask_dividend) != 0`
+/// then the divisor has a variable with positive exponent where the
+/// dividend has zero — not divisible.
+fn divmask(exponents: &[usize]) -> u64 {
+    let mut mask: u64 = 0;
+    for (i, &e) in exponents.iter().enumerate() {
+        if e > 0 && i < 64 {
+            mask |= 1u64 << i;
+        }
+    }
+    mask
+}
+
+/// Augmented leading monomial info for a basis element.
+struct AugLm {
+    /// Expanded exponent vector of LT.
+    exponents: ExpandedMonomial,
+    /// DivMask for fast divisibility rejection.
+    mask: u64,
+}
 
 fn augment_lm<P, O>(ring: P, f: El<P>, order: O) -> (El<P>, ExpandedMonomial)
 where
@@ -648,20 +678,106 @@ fn update_basis<I, P, O, SortFn>(
     SortFn: FnMut(&mut [SPoly], &[El<P>]),
     I: Iterator<Item = El<P>>,
 {
+    let n_vars = ring.indeterminate_count();
+
     for new_poly in new_polys {
+        let k = basis.len();
         basis.push(new_poly);
-        for i in 0..(basis.len() - 1) {
-            let spoly = SPoly::Standard(i, basis.len() - 1);
-            if filter_spoly(ring, spoly.clone(), &*basis, order).is_none() {
-                open.push(spoly);
-            } else {
+
+        let (gk_c, gk_m) = ring.LT(&basis[k], order).unwrap();
+        let gk_exp = ring.expand_monomial(gk_m);
+        let gk_mask = divmask(&gk_exp);
+
+        // --- Gebauer-Möller B_k criterion ---
+        // Remove old pairs S(i,j) from `open` where LT(g_k) divides
+        // lcm(LT(g_i), LT(g_j)) and the triangular condition holds.
+        // This matches CoCoA's myApplyBCriterion in TmpGReductor.C.
+        open.retain(|spoly| {
+            match spoly {
+                SPoly::Standard(i, j) => {
+                    let gi_exp = ring.expand_monomial(ring.LT(&basis[*i], order).unwrap().1);
+                    let gj_exp = ring.expand_monomial(ring.LT(&basis[*j], order).unwrap().1);
+                    // Compute lcm exponents of (i, j)
+                    let mut lcm_ij = vec![0usize; n_vars];
+                    for v in 0..n_vars {
+                        lcm_ij[v] = gi_exp[v].max(gj_exp[v]);
+                    }
+                    // Check if LT(g_k) divides lcm(LT(g_i), LT(g_j))
+                    let k_divides_lcm = (0..n_vars).all(|v| gk_exp[v] <= lcm_ij[v]);
+                    if !k_divides_lcm {
+                        return true; // keep this pair
+                    }
+                    // Check triangular condition: lcm(i,k) != lcm(i,j) AND lcm(j,k) != lcm(i,j)
+                    // (if either equals lcm(i,j), then the pair (i,j) is NOT redundant
+                    //  because the "shorter path" through k doesn't help)
+                    let mut lcm_ik = vec![0usize; n_vars];
+                    let mut lcm_jk = vec![0usize; n_vars];
+                    for v in 0..n_vars {
+                        lcm_ik[v] = gi_exp[v].max(gk_exp[v]);
+                        lcm_jk[v] = gj_exp[v].max(gk_exp[v]);
+                    }
+                    let ik_eq_ij = lcm_ik == lcm_ij;
+                    let jk_eq_ij = lcm_jk == lcm_ij;
+                    if ik_eq_ij || jk_eq_ij {
+                        return true; // keep — no shorter path through k
+                    }
+                    *filtered_spolys += 1;
+                    false // remove — g_k provides a shorter path
+                }
+                SPoly::Nilpotent(_, _) => true, // keep nilpotent pairs
+            }
+        });
+
+        // --- Generate new pairs S(i, k) for all i < k ---
+        let mut new_pairs: Vec<(SPoly, Vec<usize>)> = Vec::new();
+        for i in 0..k {
+            let spoly = SPoly::Standard(i, k);
+            if filter_spoly(ring, spoly.clone(), basis, order).is_some() {
                 *filtered_spolys += 1;
+                continue;
+            }
+            // Compute lcm exponents for M criterion
+            let gi_exp = ring.expand_monomial(ring.LT(&basis[i], order).unwrap().1);
+            let mut lcm_exp = vec![0usize; n_vars];
+            for v in 0..n_vars {
+                lcm_exp[v] = gi_exp[v].max(gk_exp[v]);
+            }
+            new_pairs.push((spoly, lcm_exp));
+        }
+
+        // --- M criterion: remove dominated pairs ---
+        // Among new pairs, if lcm(i,k) divides lcm(j,k) for some i != j,
+        // then S(j,k) is redundant. Keep only minimal lcm pairs.
+        if new_pairs.len() > 1 {
+            let mut keep = vec![true; new_pairs.len()];
+            for a in 0..new_pairs.len() {
+                if !keep[a] { continue; }
+                for b in 0..new_pairs.len() {
+                    if a == b || !keep[b] { continue; }
+                    // Check if lcm_a divides lcm_b (a dominates b → remove b)
+                    let divides = (0..n_vars).all(|v| new_pairs[a].1[v] <= new_pairs[b].1[v]);
+                    if divides && new_pairs[a].1 != new_pairs[b].1 {
+                        keep[b] = false;
+                        *filtered_spolys += 1;
+                    }
+                }
+            }
+            for (idx, (spoly, _)) in new_pairs.into_iter().enumerate() {
+                if keep[idx] {
+                    open.push(spoly);
+                }
+            }
+        } else {
+            for (spoly, _) in new_pairs {
+                open.push(spoly);
             }
         }
+
+        // Nilpotent S-polys (for local rings)
         if let Some(e) = nilpotent_power {
-            for k in 1..e {
-                let spoly = SPoly::Nilpotent(basis.len() - 1, k);
-                if filter_spoly(ring, spoly.clone(), &*basis, order).is_none() {
+            for nk in 1..e {
+                let spoly = SPoly::Nilpotent(k, nk);
+                if filter_spoly(ring, spoly.clone(), basis, order).is_none() {
                     open.push(spoly);
                 } else {
                     *filtered_spolys += 1;
