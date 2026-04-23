@@ -168,7 +168,7 @@ impl<A: Allocator + Clone> RingBase for RustBigintRingBase<A> {
 
     fn mul_assign(&self, lhs: &mut Self::Element, rhs: Self::Element) { self.mul_assign_ref(lhs, &rhs); }
 
-    fn mul_assign_ref(&self, lhs: &mut Self::Element, rhs: &Self::Element) {
+    default fn mul_assign_ref(&self, lhs: &mut Self::Element, rhs: &Self::Element) {
         let result = bigint_fma(&lhs.1, &rhs.1, Vec::new_in(self.allocator.clone()), &self.allocator);
         *lhs = RustBigint(lhs.0 ^ rhs.0, result);
     }
@@ -259,6 +259,29 @@ impl<A: Allocator + Clone> RingBase for RustBigintRingBase<A> {
     }
 
     fn is_approximate(&self) -> bool { false }
+}
+
+// Specialized fast path for the `Global` allocator (the only one used by
+// picus-solver and almost all real callers). This avoids the per-multiply
+// `Vec::new_in` allocation by recycling `lhs.1`'s existing backing buffer
+// through a thread-local scratch pool. Mirrors CoCoA's `MemPool`-backed
+// multiplication path in `BigIntImpl::mul`.
+impl RingBase for RustBigintRingBase<Global> {
+    fn mul_assign_ref(&self, lhs: &mut Self::Element, rhs: &Self::Element) {
+        // Step 1: take lhs.1's prior buffer into `lhs_copy`; `lhs.1` is
+        // left empty (zero capacity, no allocation).
+        let lhs_copy = std::mem::take(&mut lhs.1);
+        // Step 2: borrow a (cleared, capacity-preserving) buffer from the
+        // pool to use as the FMA accumulator.
+        let out = scratch_acquire();
+        // Step 3: run the multiply; `bigint_fma_global` also recycles its
+        // inner per-limb workspace through the pool.
+        let result = bigint_fma_global(&lhs_copy, &rhs.1, out);
+        lhs.1 = result;
+        lhs.0 = lhs.0 ^ rhs.0;
+        // Step 4: return lhs's prior buffer to the pool for the next call.
+        scratch_release(lhs_copy);
+    }
 }
 
 impl<A1: Allocator + Clone, A2: Allocator + Clone> IntCast<RustBigintRingBase<A2>> for RustBigintRingBase<A1> {

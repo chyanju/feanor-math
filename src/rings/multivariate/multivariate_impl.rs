@@ -79,6 +79,12 @@ where
     debug_assert!(d == check_degree);
 }
 
+#[derive(Clone, Copy, Debug)]
+struct InternalMonomialIdentifier {
+    deg: Exponent,
+    order: OrderIdx,
+}
+
 /// Stores a reference to a monomial w.r.t. a given [`MultivariatePolyRingImplBase`].
 #[repr(transparent)]
 pub struct MonomialIdentifier {
@@ -92,12 +98,6 @@ impl Debug for MonomialIdentifier {
             .field("idx", &self.data.order)
             .finish()
     }
-}
-
-#[derive(Clone, Debug)]
-struct InternalMonomialIdentifier {
-    deg: Exponent,
-    order: OrderIdx,
 }
 
 impl InternalMonomialIdentifier {
@@ -160,6 +160,8 @@ where
     max_supported_deg: Exponent,
     allocator: A,
     tmp_poly: AtomicOptionBox<Vec<(El<R>, MonomialIdentifier)>>,
+    /// Scratch buffer for merge operations (add_terms, sub_assign, etc.)
+    merge_buf: AtomicOptionBox<Vec<(El<R>, MonomialIdentifier)>>,
 }
 
 /// [`RingStore`] corresponding to [`MultivariatePolyRingImplBase`]
@@ -268,6 +270,7 @@ where
             tmp_monomials: ThreadLocal::new(),
             cum_binomial_lookup_table,
             tmp_poly: AtomicOptionBox::none(),
+            merge_buf: AtomicOptionBox::none(),
             allocator,
         })
     }
@@ -567,12 +570,185 @@ where
             let new_mon = MonomialIdentifier {
                 data: InternalMonomialIdentifier { deg: new_deg, order: new_order },
             };
-            let scaled_c = self.base_ring().mul_ref(coeff, r_c);
-            let neg_c = self.base_ring().negate(scaled_c);
-            (neg_c, new_mon)
+            // Fused negate-multiply: -(coeff * r_c)
+            let neg_scaled_c = self.base_ring().negate(self.base_ring().mul_ref(coeff, r_c));
+            (neg_scaled_c, new_mon)
         });
 
-        *target = self.add_terms(target, rhs_iter, Vec::new_in(self.allocator.clone()));
+        // Perform merge directly, reusing target's Vec allocation.
+        // Save target terms to a temp buffer, then merge back into target.data.
+        let mut old_terms = std::mem::replace(
+            &mut target.data,
+            Vec::new_in(self.allocator.clone()),
+        );
+        // Get a scratch buffer from merge_buf, or create one
+        let mut scratch = self.merge_buf
+            .swap(None, std::sync::atomic::Ordering::AcqRel)
+            .map(|b| *b)
+            .unwrap_or_default();
+        scratch.clear();
+        scratch.extend(old_terms.drain(..));
+        // Now scratch has the old target terms, old_terms is empty but keeps its allocation
+        // Merge scratch (old target) + rhs_iter into old_terms (reusing allocation)
+        old_terms.reserve(scratch.len() + reducer.data.len());
+        {
+            let mut lhs_it = scratch.iter().peekable();
+            let mut rhs_it = rhs_iter.peekable();
+
+            while let (Some((_, l_m)), Some((_, r_m))) = (lhs_it.peek(), rhs_it.peek()) {
+                match self.compare_degrevlex(&l_m.data, &r_m.data) {
+                    std::cmp::Ordering::Equal => {
+                        let (l_c, _) = lhs_it.next().unwrap();
+                        let (r_c, r_m) = rhs_it.next().unwrap();
+                        let sum = self.base_ring().add_ref_fst(l_c, r_c);
+                        // Skip zero coefficients inline (avoids remove_zeros scan)
+                        if !self.base_ring().is_zero(&sum) {
+                            old_terms.push((sum, r_m));
+                        }
+                    }
+                    std::cmp::Ordering::Less => {
+                        let (l_c, l_m) = lhs_it.next().unwrap();
+                        old_terms.push((self.base_ring().clone_el(l_c), l_m.data.clone().wrap()));
+                    }
+                    std::cmp::Ordering::Greater => {
+                        old_terms.push(rhs_it.next().unwrap());
+                    }
+                };
+            }
+            old_terms.extend(lhs_it.map(|(c, m)| (self.base_ring().clone_el(c), m.data.clone().wrap())));
+            old_terms.extend(rhs_it);
+        }
+        // Zeros already filtered inline in the merge loop above
+        debug_assert!(self.is_valid(&old_terms));
+        target.data = old_terms;
+        // Recycle scratch for next call
+        scratch.clear();
+        let _ = self.merge_buf.swap(Some(Box::new(scratch)), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Full reduction loop using a Yan-style geobucket (matching CoCoA).
+    ///
+    /// The geobucket amortizes the cost of multi-step reduction:
+    /// instead of merging the entire target polynomial on every step,
+    /// scaled reducers go into size-appropriate buckets and cascade
+    /// only when needed.  This gives O(R * log(A)) amortized cost per
+    /// step instead of O(A).
+    ///
+    /// `find_reducer` is called with `(lt_coeff, lt_deg, lt_order)`.
+    /// Returns `Some((reducer_ptr, quo_coeff, quo_deg, quo_order))`.
+    pub(crate) fn reduce_poly_geobucket<F>(
+        &self,
+        target: &mut <Self as RingBase>::Element,
+        mut find_reducer: F,
+    )
+    where
+        F: FnMut(&El<R>, u16, u64) -> Option<(*const <Self as RingBase>::Element, El<R>, u16, u64)>,
+    {
+        use crate::algorithms::geobucket::Geobucket;
+
+        if target.data.is_empty() {
+            return;
+        }
+
+        // add_assign_check_zero closure for merging
+        let add_zero_check = |target_c: &mut El<R>, val: El<R>| -> bool {
+            self.base_ring().add_assign(target_c, val);
+            self.base_ring().is_zero(target_c)
+        };
+
+        // Load target into geobucket
+        let drained: Vec<(El<R>, MonomialIdentifier)> = target.data.drain(..).collect();
+        let mut gbk = Geobucket::new();
+        gbk.load_ascending(
+            drained.into_iter().map(|(c, m)| (c, m.data.deg, m.data.order)).collect()
+        );
+
+        // Collect the remainder terms (terms that can't be reduced)
+        let mut remainder: Vec<(El<R>, u16, u64)> = Vec::new();
+
+        // Main reduction loop (matching CoCoA's ReductionStep pattern):
+        // 1. Pop the leading term from the geobucket
+        // 2. Try to find a reducer for it
+        // 3. If found: add -(quo * reducer_tail) to the geobucket (skip reducer's LM)
+        //    The LT cancellation is implicit: we popped our LT and don't add reducer's LT
+        // 4. If not found: this term is part of the remainder
+        loop {
+            let (lt_c, lt_deg, lt_order) = match gbk.pop_leading(&add_zero_check) {
+                Some(x) => x,
+                None => break, // geobucket empty
+            };
+
+            // Find a reducer
+            let found = find_reducer(&lt_c, lt_deg, lt_order);
+            let (reducer_ptr, quo_c, quo_deg, quo_order) = match found {
+                Some(x) => x,
+                None => {
+                    // No reducer found — this term is part of the remainder
+                    remainder.push((lt_c, lt_deg, lt_order));
+                    continue;
+                }
+            };
+
+            // SAFETY: reducer_ptr is valid for the duration of this call
+            let reducer: &<Self as RingBase>::Element = unsafe { &*reducer_ptr };
+
+            // Build -(quo_c * quo_mono * reducer_tail) where we SKIP the reducer's LT.
+            // The LT of the target is already removed (popped above).
+            // The scaled LT of the reducer would equal target's LT, so they cancel.
+            let mut scaled_terms: Vec<(El<R>, u16, u64)> = Vec::with_capacity(reducer.data.len());
+            let reducer_lt_deg;
+            let reducer_lt_order;
+            {
+                // The reducer's LT is the LAST term (ascending order)
+                let (_, lt_m) = reducer.data.last().unwrap();
+                reducer_lt_deg = lt_m.data.deg;
+                reducer_lt_order = lt_m.data.order;
+            }
+
+            for (r_c, r_m) in reducer.data.iter() {
+                let r_deg = r_m.data.deg;
+                let r_order = r_m.data.order;
+                // Skip the reducer's leading term (it cancels with our popped LT)
+                if r_deg == reducer_lt_deg && r_order == reducer_lt_order {
+                    continue;
+                }
+                let new_deg = r_deg + quo_deg;
+                let new_order = if r_deg <= quo_deg {
+                    if let Some(table) = self.try_get_multiplication_table(r_deg, quo_deg) {
+                        table[r_m.data.order as usize][quo_order as usize]
+                    } else {
+                        let lhs = MonomialIdentifier { data: InternalMonomialIdentifier { deg: r_deg, order: r_m.data.order } };
+                        let rhs = MonomialIdentifier { data: InternalMonomialIdentifier { deg: quo_deg, order: quo_order } };
+                        self.mul_monomial_fallback(&lhs, &rhs)
+                    }
+                } else {
+                    if let Some(table) = self.try_get_multiplication_table(quo_deg, r_deg) {
+                        table[quo_order as usize][r_m.data.order as usize]
+                    } else {
+                        let lhs = MonomialIdentifier { data: InternalMonomialIdentifier { deg: r_deg, order: r_m.data.order } };
+                        let rhs = MonomialIdentifier { data: InternalMonomialIdentifier { deg: quo_deg, order: quo_order } };
+                        self.mul_monomial_fallback(&lhs, &rhs)
+                    }
+                };
+                // Fused neg-mul: -(quo_c * r_c)
+                let neg_scaled_c = self.base_ring().negate(self.base_ring().mul_ref(&quo_c, r_c));
+                scaled_terms.push((neg_scaled_c, new_deg, new_order));
+            }
+
+            // Add the scaled reducer tail to the geobucket
+            gbk.add_poly(scaled_terms, &add_zero_check);
+        }
+
+        // Build final polynomial from remainder (in ascending order)
+        // Remainder was collected in descending order (we popped from the top)
+        remainder.reverse();
+        target.data.clear();
+        target.data.reserve(remainder.len());
+        for (c, deg, order) in remainder {
+            target.data.push((c, MonomialIdentifier {
+                data: InternalMonomialIdentifier { deg, order },
+            }));
+        }
     }
 }
 
@@ -963,6 +1139,27 @@ where
         MultivariatePolyRingImplBase::sub_assign_mul_monomial(self, target, reducer, coeff, monomial);
     }
 
+    fn reduce_poly_loop(
+        &self,
+        target: &mut Self::Element,
+        find_reducer: &mut dyn FnMut(&El<Self::BaseRing>, &Self::Monomial)
+            -> Option<(*const Self::Element, El<Self::BaseRing>, Self::Monomial)>,
+    ) -> bool {
+        // Always use geobucket for reduction in Buchberger's algorithm.
+        // Even for initially small polynomials, the accumulator can grow
+        // significantly during multi-step reduction, making geobuckets
+        // beneficial.  (Matches CoCoA's unconditional use of geobuckets
+        // in GeobucketFieldImpl.)
+        self.reduce_poly_geobucket(target, |lt_c, lt_deg, lt_order| {
+            let lt_mono = MonomialIdentifier {
+                data: InternalMonomialIdentifier { deg: lt_deg, order: lt_order },
+            };
+            let result = find_reducer(lt_c, &lt_mono);
+            result.map(|(ptr, c, m)| (ptr, c, m.data.deg, m.data.order))
+        });
+        true
+    }
+
     fn coefficient_at<'a>(&'a self, f: &'a Self::Element, m: &Self::Monomial) -> &'a El<Self::BaseRing> {
         match f
             .data
@@ -1110,6 +1307,7 @@ where
             tmp_monomials: ThreadLocal::new(),
             cum_binomial_lookup_table: self.cum_binomial_lookup_table.clone(),
             tmp_poly: AtomicOptionBox::new(None),
+            merge_buf: AtomicOptionBox::new(None),
             allocator: self.allocator.clone(),
         });
         let mut result = new_ring.from_terms(self.terms(f).map(|(c, m)| {

@@ -4,6 +4,8 @@
 pub mod bigint_ops;
 /// Contains Buchberger's algorithm for computing Groebner basis.
 pub mod buchberger;
+/// Yan-style geobucket for polynomial reduction accumulation (matching CoCoA).
+pub(crate) mod geobucket;
 /// Contains [`convolution::ConvolutionAlgorithm`], an abstraction for algorithms
 /// for computing convolutions, together with various implementations.
 pub mod convolution;

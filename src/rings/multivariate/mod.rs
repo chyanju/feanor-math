@@ -67,15 +67,31 @@ pub trait MultivariatePolyRing: RingExtension {
     {
         let mut scaled = self.clone_el(reducer);
         self.mul_assign_monomial(&mut scaled, self.clone_monomial(monomial));
-        // Scale each coefficient by coeff by negating, multiplying, re-negating
-        // (we need sub, and the simplest generic way is: target -= scaled*coeff)
-        // Since we don't have a generic scale method, use the 3-step approach:
         let coeff_poly = self.create_term(
             self.base_ring().clone_el(coeff),
             self.create_monomial((0..self.indeterminate_count()).map(|_| 0)),
         );
         self.mul_assign(&mut scaled, coeff_poly);
         self.sub_assign(target, scaled);
+    }
+
+    /// Perform a full polynomial reduction loop using an optimized accumulator.
+    ///
+    /// `find_reducer` is called with the leading coefficient and monomial of the
+    /// current target.  It should return `Some((reducer, quo_coeff, quo_monomial))`
+    /// if a reducer divides the leading term, or `None` to stop.
+    ///
+    /// Returns `true` if the fast path was used, `false` if the caller should
+    /// fall back to the generic `while find_reducer { sub_assign_mul_monomial }` loop.
+    ///
+    /// The default implementation returns `false` (not supported).
+    fn reduce_poly_loop(
+        &self,
+        _target: &mut Self::Element,
+        _find_reducer: &mut dyn FnMut(&El<Self::BaseRing>, &Self::Monomial)
+            -> Option<(*const Self::Element, El<Self::BaseRing>, Self::Monomial)>,
+    ) -> bool {
+        false
     }
 
     /// Returns the coefficient corresponding to the given monomial in the given polynomial.

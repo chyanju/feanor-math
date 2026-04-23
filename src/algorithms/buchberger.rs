@@ -62,20 +62,49 @@ where
 #[stability::unstable(feature = "enable")]
 #[derive(PartialEq, Clone, Eq, Hash)]
 pub enum SPoly {
-    Standard(usize, usize),
-    Nilpotent(
-        // poly index
-        usize,
-        // power-of-p multiplier
-        usize,
-    ),
+    /// S-polynomial pair with cached sugar degree and lcm degree.
+    Standard {
+        i: usize,
+        j: usize,
+        /// Sugar degree of this S-pair (Giovini-Mora-Niesi-Robbiano heuristic).
+        sugar: usize,
+        /// Cached degree of lcm(LT(g_i), LT(g_j)).
+        lcm_deg: usize,
+    },
+    Nilpotent {
+        /// poly index
+        idx: usize,
+        /// power-of-p multiplier
+        k: usize,
+        /// Sugar degree.
+        sugar: usize,
+        /// Cached lcm degree.
+        lcm_deg: usize,
+    },
+}
+
+impl SPoly {
+    /// Convenience accessors for sugar degree.
+    fn sugar(&self) -> usize {
+        match self {
+            SPoly::Standard { sugar, .. } => *sugar,
+            SPoly::Nilpotent { sugar, .. } => *sugar,
+        }
+    }
+    /// Convenience accessor for cached lcm degree.
+    fn cached_lcm_deg(&self) -> usize {
+        match self {
+            SPoly::Standard { lcm_deg, .. } => *lcm_deg,
+            SPoly::Nilpotent { lcm_deg, .. } => *lcm_deg,
+        }
+    }
 }
 
 impl Debug for SPoly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SPoly::Standard(i, j) => write!(f, "S({}, {})", i, j),
-            SPoly::Nilpotent(i, k) => write!(f, "p^{} F({})", k, i),
+            SPoly::Standard { i, j, sugar, .. } => write!(f, "S({}, {})s{}", i, j, sugar),
+            SPoly::Nilpotent { idx, k, sugar, .. } => write!(f, "p^{} F({})s{}", k, idx, sugar),
         }
     }
 }
@@ -144,13 +173,13 @@ impl SPoly {
         O: MonomialOrder + Copy,
     {
         match self {
-            SPoly::Standard(i, j) => term_lcm(
+            SPoly::Standard { i, j, .. } => term_lcm(
                 &ring,
                 ring.LT(&basis[*i], order).unwrap(),
                 ring.LT(&basis[*j], order).unwrap(),
             ),
-            Self::Nilpotent(i, k) => {
-                let (c, m) = ring.LT(&basis[*i], order).unwrap();
+            SPoly::Nilpotent { idx, k, .. } => {
+                let (c, m) = ring.LT(&basis[*idx], order).unwrap();
                 (
                     ring.base_ring().mul_ref_fst(
                         c,
@@ -172,7 +201,7 @@ impl SPoly {
         O: MonomialOrder + Copy,
     {
         match self {
-            SPoly::Standard(i, j) => {
+            SPoly::Standard { i, j, .. } => {
                 let (f1_factor, f2_factor, _) = term_xlcm(
                     &ring,
                     ring.LT(&basis[*i], order).unwrap(),
@@ -186,8 +215,8 @@ impl SPoly {
                 ring.inclusion().mul_assign_map(&mut f2_scaled, f2_factor.0);
                 return ring.sub(f1_scaled, f2_scaled);
             }
-            SPoly::Nilpotent(i, k) => {
-                let mut result = ring.clone_el(&basis[*i]);
+            SPoly::Nilpotent { idx, k, .. } => {
+                let mut result = ring.clone_el(&basis[*idx]);
                 ring.inclusion().mul_assign_map(
                     &mut result,
                     ring.base_ring()
@@ -211,7 +240,7 @@ where
     P::Type: MultivariatePolyRing,
     <<P::Type as RingExtension>::BaseRing as RingStore>::Type: DivisibilityRing,
     O: MonomialOrder + Copy,
-    I: Iterator<Item = (&'a El<P>, &'b ExpandedMonomial)>,
+    I: Iterator<Item = (&'a El<P>, &'b AugLm)>,
 {
     if ring.is_zero(f) {
         return None;
@@ -219,16 +248,15 @@ where
     let (f_lc, f_lm) = ring.LT(f, order).unwrap();
     let f_lm_expanded = ring.expand_monomial(f_lm);
     let f_mask = divmask(&f_lm_expanded);
+    // MISSING-3: Select shortest reducer among all valid ones
     reducers
         .enumerate()
-        .filter_map(|(i, (reducer, reducer_lm_expanded))| {
-            // DivMask fast rejection: if the reducer has a variable with
-            // positive exponent where f has zero exponent, skip.
-            let r_mask = divmask(reducer_lm_expanded);
-            if (r_mask & !f_mask) != 0 {
+        .filter_map(|(i, (reducer, reducer_aug))| {
+            // MISSING-4: Use cached DivMask from AugLm
+            if (reducer_aug.mask & !f_mask) != 0 {
                 return None;
             }
-            if (0..ring.indeterminate_count()).all(|j| reducer_lm_expanded[j] <= f_lm_expanded[j]) {
+            if (0..ring.indeterminate_count()).all(|j| reducer_aug.exponents[j] <= f_lm_expanded[j]) {
                 let (r_lc, r_lm) = ring.LT(reducer, order).unwrap();
                 let quo_m = ring.monomial_div(ring.clone_monomial(f_lm), r_lm).ok().unwrap();
                 if let Some(quo_c) = ring.base_ring().checked_div(f_lc, r_lc) {
@@ -237,11 +265,11 @@ where
             }
             return None;
         })
-        .next()
+        .min_by_key(|(_, reducer, _, _)| ring.terms(*reducer).count())
 }
 
 #[inline(never)]
-fn filter_spoly<P, O>(ring: P, new_spoly: SPoly, basis: &[El<P>], order: O) -> Option<usize>
+fn filter_spoly<P, O>(ring: P, new_spoly: &SPoly, basis: &[El<P>], order: O) -> Option<usize>
 where
     P: RingStore + Copy,
     P::Type: MultivariatePolyRing,
@@ -249,7 +277,8 @@ where
     O: MonomialOrder + Copy,
 {
     match new_spoly {
-        SPoly::Standard(i, k) => {
+        SPoly::Standard { i, j: k, .. } => {
+            let (i, k) = (*i, *k);
             assert!(i < k);
             let (bi_c, bi_m) = ring.LT(&basis[i], order).unwrap();
             let (bk_c, bk_m) = ring.LT(&basis[k], order).unwrap();
@@ -291,7 +320,8 @@ where
                 })
                 .next()
         }
-        SPoly::Nilpotent(i, k) => {
+        SPoly::Nilpotent { idx: i, k, .. } => {
+            let (i, k) = (*i, *k);
             let nilpotent_power = ring.base_ring().nilpotent_power().unwrap();
             let f = &basis[i];
 
@@ -321,20 +351,22 @@ where
 }
 
 #[stability::unstable(feature = "enable")]
-pub fn default_sort_fn<P, O>(ring: P, order: O) -> impl FnMut(&mut [SPoly], &[El<P>])
+pub fn default_sort_fn<P, O>(_ring: P, _order: O) -> impl FnMut(&mut [SPoly], &[El<P>])
 where
     P: RingStore + Copy,
     P::Type: MultivariatePolyRing,
     <<P::Type as RingExtension>::BaseRing as RingStore>::Type: PrincipalLocalRing,
     O: MonomialOrder + Copy,
 {
-    move |open, basis| {
-        open.sort_by_key(|spoly| {
-            let (lc, lm) = spoly.lcm_term(ring, basis, order);
-            (
-                -(ring.base_ring().valuation(&lc).unwrap_or(0) as i64),
-                -(ring.monomial_deg(&lm) as i64),
-            )
+    move |open, _basis| {
+        // Sort by sugar degree (primary, ascending) then lcm degree (secondary, ascending).
+        // Since the main loop processes from the END of the list, we sort in descending
+        // order so that the smallest sugar/degree pair is at the end and is selected first.
+        // The `_ring` and `_order` parameters are unused now that we sort by the cached
+        // sugar/lcm_deg fields on `SPoly` itself, but are kept for API stability.
+        open.sort_by(|a, b| {
+            b.sugar().cmp(&a.sugar())
+                .then_with(|| b.cached_lcm_deg().cmp(&a.cached_lcm_deg()))
         })
     }
 }
@@ -358,14 +390,17 @@ fn divmask(exponents: &[usize]) -> u64 {
 }
 
 /// Augmented leading monomial info for a basis element.
-struct AugLm {
+/// Stores the expanded exponent vector and cached DivMask for fast divisibility rejection.
+#[stability::unstable(feature = "enable")]
+pub struct AugLm {
     /// Expanded exponent vector of LT.
-    exponents: ExpandedMonomial,
+    pub exponents: ExpandedMonomial,
     /// DivMask for fast divisibility rejection.
-    mask: u64,
+    pub mask: u64,
 }
 
-fn augment_lm<P, O>(ring: P, f: El<P>, order: O) -> (El<P>, ExpandedMonomial)
+/// Augment a polynomial with its expanded LT exponents and cached DivMask.
+fn augment_lm<P, O>(ring: P, f: El<P>, order: O) -> (El<P>, AugLm)
 where
     P: RingStore + Copy,
     P::Type: MultivariatePolyRing,
@@ -373,7 +408,8 @@ where
     O: MonomialOrder,
 {
     let exponents = ring.expand_monomial(ring.LT(&f, order).unwrap().1);
-    return (f, exponents);
+    let mask = divmask(&exponents);
+    return (f, AugLm { exponents, mask });
 }
 
 /// Computes a Groebner basis of the ideal generated by the input basis w.r.t. the given term
@@ -430,7 +466,7 @@ where
     PolyCoeff<P>: Send + Sync,
     Controller: ComputationController,
     SortFn: FnMut(&mut [SPoly], &[El<P>]),
-    AbortFn: FnMut(&[(El<P>, ExpandedMonomial)]) -> bool,
+    AbortFn: FnMut(&[(El<P>, AugLm)]) -> bool,
 {
     buchberger_observed(ring, input_basis, order, sort_spolys, abort_early_if, controller, &mut NoObserver)
 }
@@ -458,7 +494,7 @@ where
     PolyCoeff<P>: Send + Sync,
     Controller: ComputationController,
     SortFn: FnMut(&mut [SPoly], &[El<P>]),
-    AbortFn: FnMut(&[(El<P>, ExpandedMonomial)]) -> bool,
+    AbortFn: FnMut(&[(El<P>, AugLm)]) -> bool,
     Obs: BuchbergerObserver<P>,
 {
     controller.run_computation(
@@ -475,13 +511,12 @@ where
             // Quick check: skip inter_reduce if no leading term is divisible
             // by another's (the basis is already inter-reduced).  This saves
             // ~1.5ms on every call where the input is already a GB.
-            let needs_inter_reduce = augmented.iter().enumerate().any(|(i, (_, lm_i))| {
-                let mask_i = divmask(lm_i);
-                augmented.iter().enumerate().any(|(j, (_, lm_j))| {
+            let needs_inter_reduce = augmented.iter().enumerate().any(|(i, (_, aug_i))| {
+                augmented.iter().enumerate().any(|(j, (_, aug_j))| {
                     if i == j { return false; }
-                    let mask_j = divmask(lm_j);
-                    if (mask_j & !mask_i) != 0 { return false; }
-                    (0..ring.indeterminate_count()).all(|v| lm_j[v] <= lm_i[v])
+                    // MISSING-4: Use cached DivMask
+                    if (aug_j.mask & !aug_i.mask) != 0 { return false; }
+                    (0..ring.indeterminate_count()).all(|v| aug_j.exponents[v] <= aug_i.exponents[v])
                 })
             });
 
@@ -508,7 +543,7 @@ where
                     ))
             );
 
-            let sort_reducers = |reducers: &mut [(El<P>, ExpandedMonomial)]| {
+            let sort_reducers = |reducers: &mut [(El<P>, AugLm)]| {
                 // I have no idea why, but this order seems to give the best results
                 reducers.sort_by(|(lf, _), (rf, _)| {
                     order
@@ -520,18 +555,30 @@ where
             // invariant: `(reducers) = (basis)` and there exists a reduction to zero for every `f`
             // in `basis` modulo `reducers`; reducers are always stored with an expanded
             // version of their leading monomial, in order to simplify divisibility checks
-            let mut reducers: Vec<(El<P>, ExpandedMonomial)> = input_basis
+            let mut reducers: Vec<(El<P>, AugLm)> = input_basis
                 .iter()
                 .map(|f| augment_lm(ring, ring.clone_el(f), order))
                 .collect::<Vec<_>>();
             sort_reducers(&mut reducers);
 
+            // MISSING-1: Track sugar degree for each basis element.
+            // For input polynomials, sugar = total degree.
+            let mut basis_sugar: Vec<usize> = Vec::new();
+
+            // MISSING-2: Track active status for each basis element.
+            let mut basis_active: Vec<bool> = Vec::new();
+
             let mut open = Vec::new();
             let mut basis = Vec::new();
             update_basis(
                 ring,
-                input_basis.into_iter(),
+                input_basis.into_iter().map(|f| {
+                    let sugar = ring.terms(&f).map(|(_, m)| ring.monomial_deg(m)).max().unwrap_or(0);
+                    (f, sugar)
+                }),
                 &mut basis,
+                &mut basis_sugar,
+                &mut basis_active,
                 &mut open,
                 order,
                 nilpotent_power,
@@ -539,17 +586,18 @@ where
                 &mut sort_spolys,
             );
 
-            let mut current_deg = 0;
+            let mut current_sugar: usize = 0;
             let mut filtered_spolys = 0;
             let mut changed = false;
             loop {
-                // reduce all known S-polys of minimal lcm degree; in effect, this is the same as
+                // reduce all known S-polys of minimal sugar degree; in effect, this is the same as
                 // the matrix reduction step during F4
+                // MISSING-1: Use sugar degree for batching instead of raw lcm degree
                 let spolys_to_reduce_index = open
                     .iter()
                     .enumerate()
                     .rev()
-                    .find(|(_, spoly)| ring.monomial_deg(&spoly.lcm_term(ring, &basis, order).1) > current_deg)
+                    .find(|(_, spoly)| spoly.sugar() > current_sugar)
                     .map(|(i, _)| i + 1)
                     .unwrap_or(0);
                 let spolys_to_reduce = &open[spolys_to_reduce_index..];
@@ -557,31 +605,36 @@ where
                 let computation = ShortCircuitingComputation::new();
                 let new_polys = AppendOnlyVec::new();
                 let new_poly_parents = AppendOnlyVec::new();
+                let new_poly_sugars = AppendOnlyVec::new();
                 let new_polys_ref = &new_polys;
                 let new_poly_parents_ref = &new_poly_parents;
+                let new_poly_sugars_ref = &new_poly_sugars;
                 let basis_ref = &basis;
                 let reducers_ref = &reducers;
 
                 computation
                     .handle(controller.clone())
                     .join_many(spolys_to_reduce.as_fn().map_fn(move |spoly| {
+                        let spoly_sugar = spoly.sugar();
                         move |handle: ShortCircuitingComputationHandle<(), _>| {
                             let parent_info: Vec<usize> = match spoly {
-                                SPoly::Standard(i, j) => vec![*i, *j],
-                                SPoly::Nilpotent(i, _) => vec![*i],
+                                SPoly::Standard { i, j, .. } => vec![*i, *j],
+                                SPoly::Nilpotent { idx, .. } => vec![*idx],
                             };
                             let mut f = spoly.poly(ring, basis_ref, order);
 
                             reduce_poly(
                                 ring,
                                 &mut f,
-                                || reducers_ref.iter().chain(new_polys_ref.iter()).map(|(f, lmf)| (f, lmf)),
+                                || reducers_ref.iter().chain(new_polys_ref.iter()).map(|(f, aug)| (f, aug)),
                                 order,
                             );
 
                             if !ring.is_zero(&f) {
                                 log_progress!(handle, "s");
                                 _ = new_poly_parents_ref.push(parent_info);
+                                // MISSING-1: sugar is inherited from the S-pair
+                                _ = new_poly_sugars_ref.push(spoly_sugar);
                                 _ = new_polys_ref.push(augment_lm(ring, f, order));
                             } else {
                                 log_progress!(handle, "-");
@@ -595,6 +648,7 @@ where
                 drop(open.drain(spolys_to_reduce_index..));
                 let new_polys = new_polys.into_vec();
                 let new_poly_parents = new_poly_parents.into_vec();
+                let new_poly_sugars = new_poly_sugars.into_vec();
                 _ = computation.finish()?;
 
                 // Notify observer of newly derived polynomials
@@ -623,15 +677,19 @@ where
                         return Ok(reducers.into_iter().map(|(f, _)| f).collect());
                     }
                 } else if new_polys.is_empty() {
-                    current_deg = ring.monomial_deg(&open.last().unwrap().lcm_term(ring, &basis, order).1);
-                    log_progress!(controller, "{{{}}}", current_deg);
+                    current_sugar = open.last().unwrap().sugar();
+                    log_progress!(controller, "{{{}}}", current_sugar);
                 } else {
                     changed = true;
-                    current_deg = 0;
+                    current_sugar = 0;
                     update_basis(
                         ring,
-                        new_polys.iter().map(|(f, _)| ring.clone_el(f)),
+                        new_polys.iter().zip(new_poly_sugars.iter()).map(|((f, _), &sugar)| {
+                            (ring.clone_el(f), sugar)
+                        }),
                         &mut basis,
+                        &mut basis_sugar,
+                        &mut basis_active,
                         &mut open,
                         order,
                         nilpotent_power,
@@ -680,6 +738,8 @@ fn update_basis<I, P, O, SortFn>(
     ring: P,
     new_polys: I,
     basis: &mut Vec<El<P>>,
+    basis_sugar: &mut Vec<usize>,
+    basis_active: &mut Vec<bool>,
     open: &mut Vec<SPoly>,
     order: O,
     nilpotent_power: Option<usize>,
@@ -691,71 +751,116 @@ fn update_basis<I, P, O, SortFn>(
     <<P::Type as RingExtension>::BaseRing as RingStore>::Type: PrincipalLocalRing,
     O: MonomialOrder + Copy,
     SortFn: FnMut(&mut [SPoly], &[El<P>]),
-    I: Iterator<Item = El<P>>,
+    I: Iterator<Item = (El<P>, usize)>,
 {
     let n_vars = ring.indeterminate_count();
 
-    for new_poly in new_polys {
+    // MISSING-8: Preallocate exponent scratch vectors
+    let mut tmp_gi_exp = vec![0usize; n_vars];
+    let mut tmp_gj_exp = vec![0usize; n_vars];
+    let mut tmp_lcm_ij = vec![0usize; n_vars];
+    let mut tmp_lcm_ik = vec![0usize; n_vars];
+    let mut tmp_lcm_jk = vec![0usize; n_vars];
+
+    for (new_poly, new_sugar) in new_polys {
         let k = basis.len();
         basis.push(new_poly);
+        basis_sugar.push(new_sugar);
+        basis_active.push(true);
 
-        let (gk_c, gk_m) = ring.LT(&basis[k], order).unwrap();
+        let (_gk_c, gk_m) = ring.LT(&basis[k], order).unwrap();
         let gk_exp = ring.expand_monomial(gk_m);
         let gk_mask = divmask(&gk_exp);
+        let gk_deg: usize = gk_exp.iter().copied().sum();
+
+        // MISSING-2: Deactivate old basis elements whose LT is properly divisible
+        // by new LT(g_k). We require *strict* divisibility (not just equality) for
+        // safety: when LTs are equal, the new generator's tail may differ from the
+        // old one's, and reducing one against the other would produce a useful new
+        // polynomial. CoCoA performs that interreduction explicitly; here we keep
+        // both equal-LT generators so the standard S-pair processing handles it.
+        for i in 0..k {
+            if !basis_active[i] { continue; }
+            let gi_exp_tmp = ring.expand_monomial(ring.LT(&basis[i], order).unwrap().1);
+            let gi_mask = divmask(&gi_exp_tmp);
+            // Check if LT(g_k) properly divides LT(g_i)
+            if (gk_mask & !gi_mask) != 0 { continue; }
+            let k_divides_i = (0..n_vars).all(|v| gk_exp[v] <= gi_exp_tmp[v]);
+            let is_proper = k_divides_i && (0..n_vars).any(|v| gk_exp[v] < gi_exp_tmp[v]);
+            if is_proper {
+                basis_active[i] = false;
+            }
+        }
+
+        // MISSING-2: Remove pairs involving deactivated basis elements
+        open.retain(|spoly| {
+            match spoly {
+                SPoly::Standard { i, j, .. } => basis_active[*i] && basis_active[*j],
+                SPoly::Nilpotent { idx, .. } => basis_active[*idx],
+            }
+        });
 
         // --- Gebauer-Möller B_k criterion ---
         // Remove old pairs S(i,j) from `open` where LT(g_k) divides
         // lcm(LT(g_i), LT(g_j)) and the triangular condition holds.
-        // This matches CoCoA's myApplyBCriterion in TmpGReductor.C.
+        // MISSING-8: Use preallocated exponent vectors
         open.retain(|spoly| {
             match spoly {
-                SPoly::Standard(i, j) => {
-                    let gi_exp = ring.expand_monomial(ring.LT(&basis[*i], order).unwrap().1);
-                    let gj_exp = ring.expand_monomial(ring.LT(&basis[*j], order).unwrap().1);
+                SPoly::Standard { i, j, .. } => {
+                    ring.expand_monomial_to(ring.LT(&basis[*i], order).unwrap().1, &mut tmp_gi_exp);
+                    ring.expand_monomial_to(ring.LT(&basis[*j], order).unwrap().1, &mut tmp_gj_exp);
                     // Compute lcm exponents of (i, j)
-                    let mut lcm_ij = vec![0usize; n_vars];
                     for v in 0..n_vars {
-                        lcm_ij[v] = gi_exp[v].max(gj_exp[v]);
+                        tmp_lcm_ij[v] = tmp_gi_exp[v].max(tmp_gj_exp[v]);
                     }
                     // Check if LT(g_k) divides lcm(LT(g_i), LT(g_j))
-                    let k_divides_lcm = (0..n_vars).all(|v| gk_exp[v] <= lcm_ij[v]);
+                    let k_divides_lcm = (0..n_vars).all(|v| gk_exp[v] <= tmp_lcm_ij[v]);
                     if !k_divides_lcm {
                         return true; // keep this pair
                     }
                     // Check triangular condition: lcm(i,k) != lcm(i,j) AND lcm(j,k) != lcm(i,j)
-                    // (if either equals lcm(i,j), then the pair (i,j) is NOT redundant
-                    //  because the "shorter path" through k doesn't help)
-                    let mut lcm_ik = vec![0usize; n_vars];
-                    let mut lcm_jk = vec![0usize; n_vars];
                     for v in 0..n_vars {
-                        lcm_ik[v] = gi_exp[v].max(gk_exp[v]);
-                        lcm_jk[v] = gj_exp[v].max(gk_exp[v]);
+                        tmp_lcm_ik[v] = tmp_gi_exp[v].max(gk_exp[v]);
+                        tmp_lcm_jk[v] = tmp_gj_exp[v].max(gk_exp[v]);
                     }
-                    let ik_eq_ij = lcm_ik == lcm_ij;
-                    let jk_eq_ij = lcm_jk == lcm_ij;
+                    let ik_eq_ij = tmp_lcm_ik[..n_vars] == tmp_lcm_ij[..n_vars];
+                    let jk_eq_ij = tmp_lcm_jk[..n_vars] == tmp_lcm_ij[..n_vars];
                     if ik_eq_ij || jk_eq_ij {
                         return true; // keep — no shorter path through k
                     }
                     *filtered_spolys += 1;
                     false // remove — g_k provides a shorter path
                 }
-                SPoly::Nilpotent(_, _) => true, // keep nilpotent pairs
+                SPoly::Nilpotent { .. } => true, // keep nilpotent pairs
             }
         });
 
-        // --- Generate new pairs S(i, k) for all i < k ---
+        // --- Generate new pairs S(i, k) for all active i < k ---
         let mut new_pairs: Vec<(SPoly, Vec<usize>)> = Vec::new();
         for i in 0..k {
-            let spoly = SPoly::Standard(i, k);
-            if filter_spoly(ring, spoly.clone(), basis, order).is_some() {
-                *filtered_spolys += 1;
-                continue;
-            }
-            // Compute lcm exponents for M criterion
+            // MISSING-2: Skip deactivated basis elements
+            if !basis_active[i] { continue; }
+
+            // Compute lcm exponents for M criterion + sugar + cached lcm_deg
             let gi_exp = ring.expand_monomial(ring.LT(&basis[i], order).unwrap().1);
             let mut lcm_exp = vec![0usize; n_vars];
             for v in 0..n_vars {
                 lcm_exp[v] = gi_exp[v].max(gk_exp[v]);
+            }
+            // MISSING-5: Cached lcm degree
+            let lcm_deg_val: usize = lcm_exp.iter().copied().sum();
+            let gi_deg: usize = gi_exp.iter().copied().sum();
+
+            // MISSING-1: Compute sugar degree for the pair
+            let sugar_val = std::cmp::max(
+                basis_sugar[i] + lcm_deg_val - gi_deg,
+                basis_sugar[k] + lcm_deg_val - gk_deg,
+            );
+
+            let spoly = SPoly::Standard { i, j: k, sugar: sugar_val, lcm_deg: lcm_deg_val };
+            if filter_spoly(ring, &spoly, basis, order).is_some() {
+                *filtered_spolys += 1;
+                continue;
             }
             new_pairs.push((spoly, lcm_exp));
         }
@@ -791,8 +896,10 @@ fn update_basis<I, P, O, SortFn>(
         // Nilpotent S-polys (for local rings)
         if let Some(e) = nilpotent_power {
             for nk in 1..e {
-                let spoly = SPoly::Nilpotent(k, nk);
-                if filter_spoly(ring, spoly.clone(), basis, order).is_none() {
+                let lcm_deg_val = gk_deg; // LT doesn't change for nilpotent
+                let sugar_val = basis_sugar[k]; // sugar inherited
+                let spoly = SPoly::Nilpotent { idx: k, k: nk, sugar: sugar_val, lcm_deg: lcm_deg_val };
+                if filter_spoly(ring, &spoly, basis, order).is_none() {
                     open.push(spoly);
                 } else {
                     *filtered_spolys += 1;
@@ -810,12 +917,48 @@ where
     <<P::Type as RingExtension>::BaseRing as RingStore>::Type: DivisibilityRing,
     O: MonomialOrder + Copy,
     F: FnMut() -> I,
-    I: Iterator<Item = (&'a El<P>, &'b ExpandedMonomial)>,
+    I: Iterator<Item = (&'a El<P>, &'b AugLm)>,
 {
+    // The accumulator fast path is only valid for DegRevLex, since the
+    // internal linked-list is sorted by (deg, order) which matches DegRevLex.
+    if order.is_same(&DegRevLex) {
+        let used_fast_path = ring.get_ring().reduce_poly_loop(
+            to_reduce,
+            &mut |lt_c: &PolyCoeff<P>, lt_m: &PolyMonomial<P>| {
+                let f_lm_expanded = ring.expand_monomial(lt_m);
+                let f_mask = divmask(&f_lm_expanded);
+                // MISSING-3: Select shortest reducer via min_by_key
+                reducers()
+                    .filter_map(|(reducer, reducer_aug)| {
+                        // MISSING-4: Use cached DivMask from AugLm
+                        if (reducer_aug.mask & !f_mask) != 0 {
+                            return None;
+                        }
+                        if (0..ring.indeterminate_count()).all(|j| reducer_aug.exponents[j] <= f_lm_expanded[j]) {
+                            let (r_lc, r_lm) = ring.LT(reducer, order).unwrap();
+                            let quo_m = ring.monomial_div(ring.clone_monomial(lt_m), r_lm).ok().unwrap();
+                            if let Some(quo_c) = ring.base_ring().checked_div(lt_c, r_lc) {
+                                return Some((
+                                    reducer as *const El<P>,
+                                    quo_c,
+                                    quo_m,
+                                    ring.terms(reducer).count(),
+                                ));
+                            }
+                        }
+                        None
+                    })
+                    .min_by_key(|(_, _, _, count)| *count)
+                    .map(|(ptr, c, m, _)| (ptr, c, m))
+            },
+        );
+        if used_fast_path {
+            return;
+        }
+    }
+
+    // Fallback: generic loop
     while let Some((_, reducer, quo_c, quo_m)) = find_reducer(ring, to_reduce, reducers(), order) {
-        // Fused multiply-subtract: target -= quo_c * quo_m * reducer
-        // This avoids the intermediate clone + mul_monomial + sub pattern,
-        // matching CoCoA's myAddMulSummand single-pass merge.
         ring.sub_assign_mul_monomial(to_reduce, reducer, &quo_c, &quo_m);
     }
 }
@@ -829,15 +972,19 @@ where
     O: MonomialOrder + Copy,
     I: Clone + Iterator<Item = &'a El<P>>,
 {
-    let lms = reducers
+    let augs = reducers
         .clone()
-        .map(|f| ring.expand_monomial(ring.LT(f, order).unwrap().1))
+        .map(|f| {
+            let exponents = ring.expand_monomial(ring.LT(f, order).unwrap().1);
+            let mask = divmask(&exponents);
+            AugLm { exponents, mask }
+        })
         .collect::<Vec<_>>();
-    reduce_poly(ring, &mut f, || reducers.clone().zip(lms.iter()), order);
+    reduce_poly(ring, &mut f, || reducers.clone().zip(augs.iter()), order);
     return f;
 }
 
-fn inter_reduce<P, O>(ring: P, mut polys: Vec<(El<P>, ExpandedMonomial)>, order: O) -> Vec<(El<P>, ExpandedMonomial)>
+fn inter_reduce<P, O>(ring: P, mut polys: Vec<(El<P>, AugLm)>, order: O) -> Vec<(El<P>, AugLm)>
 where
     P: RingStore + Copy,
     P::Type: MultivariatePolyRing,
@@ -854,20 +1001,33 @@ where
             let (reducers, to_reduce) = polys.split_at_mut(last_i);
             let to_reduce = &mut to_reduce[0];
 
+            // MISSING-6: Remember old LT to detect if reduction changed it
+            let old_deg = to_reduce.1.exponents.iter().copied().sum::<usize>();
+            let old_mask = to_reduce.1.mask;
+
             reduce_poly(
                 ring,
                 &mut to_reduce.0,
-                || reducers.iter().map(|(f, lmf)| (f, lmf)),
+                || reducers.iter().map(|(f, aug)| (f, aug)),
                 order,
             );
 
             // undo swap so that the outer loop still iterates over every poly
             if !ring.is_zero(&to_reduce.0) {
-                to_reduce.1 = ring.expand_monomial(ring.LT(&to_reduce.0, order).unwrap().1);
+                let new_exponents = ring.expand_monomial(ring.LT(&to_reduce.0, order).unwrap().1);
+                let new_mask = divmask(&new_exponents);
+                let new_deg: usize = new_exponents.iter().copied().sum();
+                // MISSING-6: If LT changed, mark changed to trigger another pass
+                if new_deg != old_deg || new_mask != old_mask {
+                    changed = true;
+                }
+                to_reduce.1 = AugLm { exponents: new_exponents, mask: new_mask };
                 polys.swap(i, last_i);
                 i += 1;
             } else {
                 _ = polys.pop().unwrap();
+                // A polynomial was reduced to zero — this changes the set, trigger another pass
+                changed = true;
             }
         }
     }

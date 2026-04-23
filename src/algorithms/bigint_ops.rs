@@ -1,5 +1,8 @@
 use core::fmt;
 use std::alloc::Allocator;
+#[cfg(test)]
+use std::alloc::Global;
+use std::cell::RefCell;
 use std::cmp::{Ordering, max, min};
 
 use serde::Deserializer;
@@ -10,6 +13,44 @@ use crate::seq::*;
 type BlockInt = u64;
 type DoubleBlockInt = u128;
 const BLOCK_BITS: u32 = u64::BITS;
+
+// CoCoA-MemPool-equivalent: thread-local free list of `Vec<u64>` scratch buffers
+// to avoid per-multiply heap allocations in the hot inner loop of modular
+// arithmetic. CoCoA's `MemPool.C` recycles fixed-size slots; here we recycle
+// `Vec<u64>` (capacity preserved across `.clear()`), which serves the same
+// role for arbitrary-precision integer scratch buffers.
+//
+// Capped to avoid unbounded memory growth in pathological cases.
+const SCRATCH_POOL_MAX: usize = 16;
+
+thread_local! {
+    static BIGINT_SCRATCH_POOL: RefCell<Vec<Vec<BlockInt>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Acquire a scratch `Vec<u64>` from the thread-local pool, or allocate
+/// a new empty one if the pool is empty. The returned vector is empty
+/// (length 0) but may have non-zero capacity.
+#[inline]
+pub(crate) fn scratch_acquire() -> Vec<BlockInt> {
+    BIGINT_SCRATCH_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        pool.pop().unwrap_or_default()
+    })
+}
+
+/// Return a scratch `Vec<u64>` to the thread-local pool for reuse.
+/// The vector is cleared (length set to 0) but its capacity is preserved.
+#[inline]
+pub(crate) fn scratch_release(mut buf: Vec<BlockInt>) {
+    buf.clear();
+    BIGINT_SCRATCH_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < SCRATCH_POOL_MAX {
+            pool.push(buf);
+        }
+        // else: drop, freeing memory
+    });
+}
 
 fn expand<A: Allocator>(x: &mut Vec<BlockInt, A>, len: usize) {
     if len > x.len() {
@@ -214,6 +255,40 @@ pub fn bigint_fma<A: Allocator, A2: Allocator>(
             bigint_mul_small(&mut val, rhs[i]);
             bigint_add(&mut out, val.as_ref(), i);
         }
+    }
+    debug_assert!(
+        highest_set_block(&out).is_none() || highest_set_block(&out).unwrap() as isize >= out.len() as isize - 2
+    );
+    return out;
+}
+
+/// `Global`-allocator fast path equivalent to
+/// `bigint_fma(lhs, rhs, out, Global)`, but routes the inner per-limb
+/// workspace through the thread-local scratch pool to avoid a fresh
+/// allocation on every call.  Mirrors CoCoA's MemPool-backed
+/// multiplication path.
+#[inline]
+pub(crate) fn bigint_fma_global(
+    lhs: &[BlockInt],
+    rhs: &[BlockInt],
+    mut out: Vec<BlockInt>,
+) -> Vec<BlockInt> {
+    let prev_len = highest_set_block(&out).map(|x| x + 1).unwrap_or(0);
+    let new_len = max(
+        prev_len + 1,
+        highest_set_block(lhs)
+            .and_then(|lb| highest_set_block(rhs).map(|rb| lb + rb + 2))
+            .unwrap_or(0),
+    );
+    out.resize(new_len, 0);
+    if let Some(d) = highest_set_block(rhs) {
+        let mut val = scratch_acquire();
+        for i in 0..=d {
+            assign(&mut val, lhs);
+            bigint_mul_small(&mut val, rhs[i]);
+            bigint_add(&mut out, val.as_ref(), i);
+        }
+        scratch_release(val);
     }
     debug_assert!(
         highest_set_block(&out).is_none() || highest_set_block(&out).unwrap() as isize >= out.len() as isize - 2
@@ -557,8 +632,6 @@ where
     return deserializer.deserialize_tuple(2, ResultVisitor { from_bytes });
 }
 
-#[cfg(test)]
-use std::alloc::Global;
 
 #[cfg(test)]
 fn parse(s: &str, base: u32) -> Vec<BlockInt> {
