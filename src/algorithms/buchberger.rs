@@ -1118,16 +1118,19 @@ where
                     log_progress!(controller, "(I=R)");
                     return Ok(vec![ring.one()]);
                 }
-                // reduce all known S-polys of minimal sugar degree; in effect, this is the same as
-                // the matrix reduction step during F4
-                // MISSING-1: Use sugar degree for batching instead of raw lcm degree
-                let spolys_to_reduce_index = open
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, spoly)| spoly.sugar() > current_sugar)
-                    .map(|(i, _)| i + 1)
-                    .unwrap_or(0);
+                // Plan v3 Task 06 — one-at-a-time S-pair processing.
+                // CoCoA processes a single S-pair per main-loop iteration
+                // (`TmpGReductor.C:670-707`). The previous code collected
+                // all same-sugar S-pairs into a parallel batch. With
+                // restart removed (Task 01) and inter-reduce moved to
+                // termination (Task 02), batching no longer offers
+                // benefit; matching CoCoA's single-pair semantics
+                // ensures the same processing order.
+                let spolys_to_reduce_index = if open.is_empty() {
+                    0
+                } else {
+                    open.len() - 1
+                };
                 let spolys_to_reduce = &open[spolys_to_reduce_index..];
 
                 // Sprint 2.6b: pair-count profiling — start of a sugar batch.
@@ -1289,7 +1292,13 @@ where
                             observer,
                         );
                     } else {
-                        return Ok(reducers.into_iter().map(|(f, _)| f).collect());
+                        // Plan v3 Task 02 — final inter-reduce.
+                        // CoCoA inter-reduces once at the end of the GB
+                        // computation rather than after every sugar batch.
+                        // This matches that pattern.
+                        let mut final_reducers = inter_reduce(ring, reducers, order);
+                        sort_reducers_by(ring, order, &mut final_reducers);
+                        return Ok(final_reducers.into_iter().map(|(f, _)| f).collect());
                     }
                 } else if new_polys.is_empty() {
                     current_sugar = open.last().unwrap().sugar();
@@ -1320,12 +1329,15 @@ where
                     );
 
                     reducers.extend(new_polys);
-                    reducers = inter_reduce(ring, reducers, order);
+                    // Plan v3 Task 02 — per-batch inter_reduce removed.
+                    // CoCoA inter-reduces only once at the end. Per-batch
+                    // inter-reduction was O(|reducers|²) work paid every
+                    // sugar batch (~thousands per circuit). The final
+                    // inter-reduce at loop termination handles cleanup.
                     sort_reducers_by(ring, order, &mut reducers);
                     log_progress!(controller, "(r={})", reducers.len());
-                    // MISSING-3: post-inter_reduce check.  An S-poly might
-                    // have reduced to a unit; bail out before the next
-                    // S-pair selection round.
+                    // MISSING-3 retained: short-circuit if a unit appeared.
+                    // This check is cheap and useful even without inter_reduce.
                 if ideal_one_short_circuit(ring, &reducers, order) {
                         log_progress!(controller, "(I=R)");
                         return Ok(vec![ring.one()]);
@@ -1336,69 +1348,12 @@ where
                     }
                 }
 
-                // less S-polys if we restart from scratch with reducers
-                if open.len() + filtered_spolys
-                    > reducers.len() * reducers.len() / 2 + reducers.len() * nilpotent_power.unwrap_or(0) + 1
-                {
-                    log_progress!(controller, "!");
-                    // Sprint 2.8b — in-place restart.
-                    //
-                    // Previous code (Sprint 2.7 baseline) recursed into
-                    // `buchberger_observed(reducers)`, paying the full
-                    // setup cost: a redundant `augment_lm` over every
-                    // reducer (already augmented), a redundant
-                    // inter-reduce check (`reducers` was just
-                    // inter-reduced at line 1323), a redundant
-                    // `sort_reducers_by` (already sorted at line 1324),
-                    // and the recursion stack frame itself.
-                    //
-                    // Profile data (Sprint 2.6b/2.7/2.8a, MontgomeryAdd
-                    // 60 s) showed `restarts ≈ buchberger_calls`: every
-                    // top-level call triggered exactly one restart, so
-                    // the recursive setup cost was paid on essentially
-                    // every invocation.
-                    //
-                    // The restart's *purpose* is to rebuild the pair
-                    // queue from the current `reducers` set (because
-                    // `open + filtered_spolys` has grown disproportionate
-                    // to the basis size).  We can do that in-place:
-                    // clear the per-batch state, repopulate `basis` /
-                    // `open` from the current `reducers` via
-                    // `update_basis`, and `continue` the outer loop.
-                    //
-                    // `reducers` itself is preserved unchanged.  Stat
-                    // counters that tracked restarts via
-                    // `on_initial_basis` will no longer increment for
-                    // these in-place restarts, which is correct
-                    // (no genuine "new top-level call" happens).
-                    basis.clear();
-                    basis_sugar.clear();
-                    basis_active.clear();
-                    open.clear();
-                    current_sugar = 0;
-                    filtered_spolys = 0;
-                    changed = false;
-                    let restart_inputs: Vec<(El<P>, usize)> = reducers
-                        .iter()
-                        .map(|(f, _)| {
-                            let sugar = ring.terms(f).map(|(_, m)| ring.monomial_deg(m)).max().unwrap_or(0);
-                            (ring.clone_el(f), sugar)
-                        })
-                        .collect();
-                    update_basis(
-                        ring,
-                        restart_inputs.into_iter(),
-                        &mut basis,
-                        &mut basis_sugar,
-                        &mut basis_active,
-                        &mut open,
-                        order,
-                        nilpotent_power,
-                        &mut 0,
-                        &mut sort_spolys,
-                    );
-                    continue;
-                }
+                // Plan v3 Task 01 — restart heuristic removed.
+                // CoCoA never restarts; it processes the pair queue
+                // straight through to completion. The previous restart
+                // (Sprint 2.8b) fired on essentially every top-level
+                // call (29,216/29,217 on MontgomeryAdd) and was a
+                // major source of redundant work. Removed.
             }
         },
     )
@@ -1443,32 +1398,29 @@ fn update_basis<I, P, O, SortFn>(
         let gk_mask = divmask(&gk_exp);
         let gk_deg: usize = gk_exp.iter().copied().sum();
 
-        // MISSING-2: Deactivate old basis elements whose LT is properly divisible
-        // by new LT(g_k). We require *strict* divisibility (not just equality) for
-        // safety: when LTs are equal, the new generator's tail may differ from the
-        // old one's, and reducing one against the other would produce a useful new
-        // polynomial. CoCoA performs that interreduction explicitly; here we keep
-        // both equal-LT generators so the standard S-pair processing handles it.
+        // Plan v3 Task 04 — match CoCoA non-strict deactivation.
+        // CoCoA (`TmpGReductor.C:500`) uses `IsDivisibleFast(LT_old, LT_new)`
+        // — non-strict divisibility. When the new LT equals an old LT,
+        // the old element is deactivated. The previous strict-divisibility
+        // check kept both equal-LT generators, paying for redundant
+        // S-pair processing instead.
         for i in 0..k {
             if !basis_active[i] { continue; }
             let gi_exp_tmp = ring.expand_monomial(ring.LT(&basis[i], order).unwrap().1);
             let gi_mask = divmask(&gi_exp_tmp);
-            // Check if LT(g_k) properly divides LT(g_i)
+            // Check if LT(g_k) divides LT(g_i) (non-strict, includes equality)
             if (gk_mask & !gi_mask) != 0 { continue; }
             let k_divides_i = (0..n_vars).all(|v| gk_exp[v] <= gi_exp_tmp[v]);
-            let is_proper = k_divides_i && (0..n_vars).any(|v| gk_exp[v] < gi_exp_tmp[v]);
-            if is_proper {
+            if k_divides_i {
                 basis_active[i] = false;
             }
         }
 
-        // MISSING-2: Remove pairs involving deactivated basis elements
-        open.retain(|spoly| {
-            match spoly {
-                SPoly::Standard { i, j, .. } => basis_active[*i] && basis_active[*j],
-                SPoly::Nilpotent { idx, .. } => basis_active[*idx],
-            }
-        });
+        // Plan v3 Task 04 — keep pairs of deactivated elements.
+        // CoCoA does NOT remove pairs whose basis members were deactivated;
+        // those pairs may still reduce to non-zero polynomials and matter
+        // for correctness. Leaving them in `open` matches CoCoA's behavior.
+        // (Previous code: `open.retain(...)` removed them — REMOVED.)
 
         // --- Gebauer-Möller B_k criterion ---
         // Remove old pairs S(i,j) from `open` where LT(g_k) divides
