@@ -1145,6 +1145,34 @@ where
         find_reducer: &mut dyn FnMut(&El<Self::BaseRing>, &Self::Monomial)
             -> Option<(*const Self::Element, El<Self::BaseRing>, Self::Monomial)>,
     ) -> bool {
+        // Sprint 2.3.2: forward to the observer-aware variant with a
+        // no-op observer, preserving the original (no-sugar) behavior.
+        self.reduce_poly_loop_with_observer(target, find_reducer, &mut |_, _| {})
+    }
+
+    fn reduce_poly_loop_with_observer(
+        &self,
+        target: &mut Self::Element,
+        find_reducer: &mut dyn FnMut(&El<Self::BaseRing>, &Self::Monomial)
+            -> Option<(*const Self::Element, El<Self::BaseRing>, Self::Monomial)>,
+        on_reducer_applied: &mut dyn FnMut(*const Self::Element, usize),
+    ) -> bool {
+        // OPTIMIZATION (T3.3): Conditional geobucket.
+        // CoCoA `SparsePolyOps-reduce.C:232 vs 249` only engages geobuckets
+        // when the target has more than a small threshold of terms — the
+        // setup cost (drain target, allocate logarithmic buckets) is wasted
+        // on tiny polynomials where 1-2 reduction steps suffice.  Returning
+        // `false` here delegates to `reduce_poly`'s plain fallback loop.
+        //
+        // Threshold of 4 chosen conservatively: principal-ideal/coprime-LT
+        // already short-circuited the trivially small cases, so anything
+        // reaching here with ≤4 terms is dense enough that the plain loop's
+        // O(n²) sub_assign_mul is faster than geobucket setup overhead.
+        const GEOBUCKET_THRESHOLD: usize = 4;
+        if target.data.len() <= GEOBUCKET_THRESHOLD {
+            return false;
+        }
+
         // Always use geobucket for reduction in Buchberger's algorithm.
         // Even for initially small polynomials, the accumulator can grow
         // significantly during multi-step reduction, making geobuckets
@@ -1155,6 +1183,13 @@ where
                 data: InternalMonomialIdentifier { deg: lt_deg, order: lt_order },
             };
             let result = find_reducer(lt_c, &lt_mono);
+            // Sprint 2.3.2: surface the cofactor's total degree (`m.data.deg`)
+            // to the observer.  This is exactly the `deg(cofactor)` term
+            // in the canonical sugar update
+            // `s_target := max(s_target, deg(cofactor) + sugar(reducer))`.
+            if let Some((ptr, _, ref m)) = result {
+                on_reducer_applied(ptr, m.data.deg as usize);
+            }
             result.map(|(ptr, c, m)| (ptr, c, m.data.deg, m.data.order))
         });
         true

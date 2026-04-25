@@ -4,6 +4,7 @@
 pub mod bigint_ops;
 /// Contains Buchberger's algorithm for computing Groebner basis.
 pub mod buchberger;
+pub mod buchberger_pair_profile;
 /// Yan-style geobucket for polynomial reduction accumulation (matching CoCoA).
 pub(crate) mod geobucket;
 /// Contains [`convolution::ConvolutionAlgorithm`], an abstraction for algorithms
@@ -32,6 +33,8 @@ pub mod fincke_pohst;
 /// Contains algorithms for computing the Galois group and Galois closure of a
 /// [`crate::rings::extension::number_field::NumberField`].
 pub mod galois;
+
+pub mod hilbert;
 /// Contains an implementation of the bisection method for computing roots, but
 /// working with integers only.
 pub mod int_bisect;

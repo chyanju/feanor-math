@@ -87,9 +87,44 @@ pub trait MultivariatePolyRing: RingExtension {
     /// The default implementation returns `false` (not supported).
     fn reduce_poly_loop(
         &self,
+        target: &mut Self::Element,
+        find_reducer: &mut dyn FnMut(&El<Self::BaseRing>, &Self::Monomial)
+            -> Option<(*const Self::Element, El<Self::BaseRing>, Self::Monomial)>,
+    ) -> bool {
+        // Sprint 2.3.2: forward to the observer-aware variant with a
+        // no-op observer.  Implementations may override either method;
+        // overriding only this one preserves the previous (no-sugar)
+        // behavior unchanged.
+        self.reduce_poly_loop_with_observer(target, find_reducer, &mut |_, _| {})
+    }
+
+    /// MISSING (Sprint 2.3.2, R4 §6 / `SugarDegree.C:62-63`):
+    /// Variant of `reduce_poly_loop` that invokes `on_reducer_applied`
+    /// once per successful reduction step.
+    ///
+    /// `on_reducer_applied(reducer_ptr, cofactor_deg)` is called *just
+    /// after* the caller's `find_reducer` returns `Some(...)`, with:
+    ///
+    /// * `reducer_ptr` — the same `*const Self::Element` returned from
+    ///   `find_reducer`, so the caller can identify which basis element
+    ///   was used (e.g., look up its sugar by pointer identity);
+    /// * `cofactor_deg` — the total degree of the cofactor monomial
+    ///   (the `quo_monomial` returned by `find_reducer`).
+    ///
+    /// The intended use is canonical Giovini–Mora–Niesi–Robbiano running
+    /// sugar update during reduction: `s_target := max(s_target,
+    /// cofactor_deg + sugar(reducer))` (mirrors `StdDegBase::myUpdate`,
+    /// `SugarDegree.C:215-218`).  Other observers (counters, debug
+    /// tracing) are equally welcome.
+    ///
+    /// The default implementation drops the observer and returns `false`
+    /// (not supported), matching `reduce_poly_loop`'s default.
+    fn reduce_poly_loop_with_observer(
+        &self,
         _target: &mut Self::Element,
         _find_reducer: &mut dyn FnMut(&El<Self::BaseRing>, &Self::Monomial)
             -> Option<(*const Self::Element, El<Self::BaseRing>, Self::Monomial)>,
+        _on_reducer_applied: &mut dyn FnMut(*const Self::Element, usize),
     ) -> bool {
         false
     }
